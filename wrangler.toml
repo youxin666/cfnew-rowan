@@ -1,5 +1,6 @@
 # Managed by the cfnew Git deployment workflow.
 # Connected to Cloudflare Worker Builds for rowan.
+# Upstream source: byJoey/cfnew.
 name = "rowan"
 main = "worker.js"
 compatibility_date = "2026-01-20"
