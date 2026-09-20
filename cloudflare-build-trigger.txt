@@ -1,1 +1,2 @@
 Cloudflare Workers Builds authorization verified on 2026-09-20.
+Repository connection recreated after GitHub App authorization.
