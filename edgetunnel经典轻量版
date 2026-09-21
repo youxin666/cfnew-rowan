@@ -9,6 +9,11 @@ let 回退地址 = 'pp.xy.kg';
 // 中转地址：经由中转服务器出站。格式 user:pass@host:port 或 host:port，留空表示不启用
 // 用户名与密码不要包含特殊字符；一旦设置，就会忽略回退地址
 let 中转地址 = '';
+// 优选地址：连接用的 CF 优选 IP 或域名，握手仍用访问域名。逗号隔开多个。
+// 每一项可以是 host:port（如 104.16.0.1:443），也可以是一个在线列表的 URL
+// （如 https://bestcf.pages.dev/vps789/top10.txt，会把里面的地址全拉进来）。
+// URL 和 host:port 可以混着填，留空就只用访问域名本身。
+let 优选地址 = '';
 // ============================================================================
 
 const 文本解码器 = new TextDecoder();
@@ -52,7 +57,7 @@ export default {
 					case '/':
 						return new Response('hello', { status: 200 });
 					case `/${认证令牌}`: {
-						const 订阅内容 = 生成订阅配置(认证令牌, request.headers.get('Host'));
+						const 订阅内容 = await 生成订阅配置(认证令牌, request.headers.get('Host'));
 						return new Response(`${订阅内容}`, {
 							status: 200,
 							headers: {
@@ -756,42 +761,88 @@ function 解析中转地址(地址) {
 }
 
 /**
- *
- * @param {string} 认证令牌
- * @param {string | null} 主机名
- * @returns {string}
+ * 按配置区「优选地址」收集连接用地址。
+ * 每一项可以是 host:port，也可以是在线列表的 URL（逐行 host:port#备注）。
+ * @param {string} 主机名 访问域名，作兜底
+ * @returns {Promise<Array<{地址: string, 端口: string, 备注: string}>>}
  */
-function 生成订阅配置(认证令牌, 主机名) {
-	const 协议 = 解码64('dmxlc3M=');
-	const 主链接 =
-		`${协议}` +
-		`://${认证令牌}@${主机名}:443` +
-		`?encryption=none&security=tls&sni=${主机名}&fp=randomized&type=ws&host=${主机名}&path=%2F%3Fed%3D2048#${主机名}`;
+async function 收集优选地址(主机名) {
+	const 结果 = [];
+	const 已见 = new Set();
+	const 加入 = (原始) => {
+		const 文本 = (原始 || '').trim();
+		if (!文本) return;
+		const 井号分割 = 文本.split('#');
+		const 备注 = 井号分割.length > 1 ? 井号分割.slice(1).join('#').trim() : '';
+		const 地址端口 = 井号分割[0].trim();
+		if (!地址端口) return;
+		let 地址;
+		let 端口;
+		const 六 = 地址端口.match(/^\[(.+)\]:(\d+)$/);
+		if (六) {
+			地址 = 六[1];
+			端口 = 六[2];
+		} else if (地址端口.includes(':') && 地址端口.split(':').length === 2) {
+			[地址, 端口] = 地址端口.split(':');
+		} else {
+			地址 = 地址端口;
+			端口 = '443';
+		}
+		地址 = (地址 || '').trim();
+		端口 = (端口 || '443').trim();
+		if (!地址) return;
+		const 键 = `${地址}:${端口}`;
+		if (已见.has(键)) return;
+		已见.add(键);
+		结果.push({ 地址, 端口, 备注: 备注 || 键 });
+	};
 
-	return `
-################################################################
-${解码64('djJyYXk=')}
----------------------------------------------------------------
-${主链接}
----------------------------------------------------------------
-################################################################
-${解码64('Y2xhc2gtbWV0YQ==')}
----------------------------------------------------------------
-- type: ${解码64('dmxlc3M=')}
-  name: ${主机名}
-  server: ${主机名}
-  port: 443
-  uuid: ${认证令牌}
-  network: ws
-  tls: true
-  udp: false
-  sni: ${主机名}
-  client-fingerprint: chrome
-  ws-opts:
-    path: "/?ed=2048"
-    headers:
-      host: ${主机名}
----------------------------------------------------------------
-################################################################
-`;
+	// 分隔符兼容中英文逗号
+	const 配置项列表 = (优选地址 || '').split(/[,，]/).map((项) => 项.trim()).filter((项) => 项);
+	for (const 配置项 of 配置项列表) {
+		if (/^https?:\/\//i.test(配置项)) {
+			try {
+				const 响应 = await fetch(配置项, { cf: { cacheTtl: 300 } });
+				if (响应.ok) {
+					const 正文 = await 响应.text();
+					for (const 行 of 正文.split('\n')) 加入(行);
+				}
+			} catch (err) {
+				// 拉取失败就跳过这条 URL
+			}
+		} else {
+			加入(配置项);
+		}
+	}
+
+	if (结果.length === 0 && 主机名) 加入(主机名);
+	return 结果;
+}
+
+/**
+ * 生成订阅内容：为「优选地址」里每个地址各生成一条节点，连接走优选地址，
+ * TLS 握手与 WS host 仍用访问域名，最后整体 base64 编码，可直接订阅。
+ * @param {string} 认证令牌
+ * @param {string | null} 主机名 访问域名
+ * @returns {Promise<string>}
+ */
+async function 生成订阅配置(认证令牌, 主机名) {
+	const 协议 = 解码64('dmxlc3M=');
+	const 域名 = 主机名 || '';
+	// CF 的明文端口走 ws（不加密），其余端口走 wss（TLS），据此自动切换
+	const 明文端口 = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+	const 地址列表 = await 收集优选地址(域名);
+	const 链接列表 = 地址列表.map((项) => {
+		const 安全地址 = 项.地址.includes(':') ? `[${项.地址}]` : 项.地址;
+		const 是明文 = 明文端口.includes(Number(项.端口));
+		// randomized fingerprint may cause TLS compatibility issues with some Xray/uTLS clients.
+		// Use chrome as default for better compatibility.
+		const 安全参数 = 是明文
+			? 'security=none'
+			: `security=tls&sni=${域名}&fp=chrome`;
+		return `${协议}://${认证令牌}@${安全地址}:${项.端口}` +
+			`?encryption=none&${安全参数}&type=ws&host=${域名}&path=%2F%3Fed%3D2048` +
+			`#${encodeURIComponent(项.备注)}`;
+	});
+	return btoa(链接列表.join('\n'));
 }
